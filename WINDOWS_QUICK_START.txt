@@ -1,0 +1,20 @@
+RESEARCHPILOT v0.2  —  WINDOWS POWERSHELL
+
+Run these commands INSIDE the extracted project folder (where README.md exists):
+
+1) python -m unittest discover -s tests -v
+2) python -m pip install -r requirements.txt
+3) Obtain a Google AI Studio API key from https://aistudio.google.com/apikey
+4) $env:GEMINI_API_KEY = Read-Host "Enter your Google AI Studio API key"
+5) python -m researchpilot.experiment generate --provider gemini --model gemma-4-26b-a4b-it --max-tasks 3
+6) Start Docker Desktop; run: docker pull python:3.12-slim
+7) python -m researchpilot.experiment score
+8) python -m researchpilot.experiment report
+
+Check results/gemma_scores.json and results/gemma_pilot_report.md.
+
+No Docker? Stop after step 5. Generated code was saved but must not be executed
+outside Docker. NO model experiment is included in the downloadable archive.
+
+Do not paste an API key into ChatGPT or take screenshots showing it.
+See README.md for explanations and full 16-task pilot.
