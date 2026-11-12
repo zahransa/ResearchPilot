@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 import re
+import random
+import time
 import shutil
 import subprocess
 import sys
@@ -158,6 +160,79 @@ class ModelClient:
         return response.choices[0].message.content or "", tokens
 
 
+# Google may transiently return 500/503 or reset the connection. Retrying must
+# be bounded; failed/incomplete requests may still carry provider billing.
+RETRYABLE_HTTP_CODES = {408, 429, 500, 502, 503, 504}
+RETRYABLE_TRANSPORT_ERRORS = {
+    "RemoteProtocolError", "ReadTimeout", "ConnectTimeout", "ConnectError",
+    "ReadError", "WriteError", "NetworkError", "RemoteDisconnected",
+    "ConnectionResetError", "TimeoutError", "APIConnectionError",
+}
+
+
+def is_transient_api_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code in RETRYABLE_HTTP_CODES
+    # The SDK's transport exceptions may be wrapped. Do not silently retry
+    # authentication or invalid model errors, which have other HTTP codes.
+    return any(type(cause).__name__ in RETRYABLE_TRANSPORT_ERRORS
+               for cause in (exc, getattr(exc, "__cause__", None)) if cause is not None)
+
+
+def generate_with_retries(client: ModelClient, prompt: str, task_id: str,
+                          variant: int, max_retries: int = 4,
+                          initial_delay: float = 4.0) -> tuple[str, dict[str, Any], int]:
+    for attempt in range(max_retries + 1):
+        try:
+            output, usage = client.generate(prompt)
+            return output, usage, attempt
+        except Exception as exc:
+            if not is_transient_api_error(exc) or attempt >= max_retries:
+                raise
+            delay = min(60.0, initial_delay * (2 ** attempt)) + random.uniform(0, 0.5)
+            print(f"Transient API error ({type(exc).__name__}) on {task_id} "
+                  f"candidate {variant+1}; retry {attempt+1}/{max_retries} "
+                  f"after {delay:.1f}s", flush=True)
+            time.sleep(delay)
+    raise AssertionError("retry loop exhausted")
+
+
+def seed_from_existing(report: dict[str, Any], source_path: Path,
+                       tasks: list[dict[str, Any]]) -> None:
+    """Reuse ONLY actual model outputs generated under identical protocols.
+
+    The former pilot may have a different max_tasks value. Every other
+    scientific parameter must match; it is never acceptable to use authored
+    synthetic candidates to populate a model manifest.
+    """
+    seed = json.loads(source_path.read_text(encoding="utf-8"))
+    if seed.get("artifact_kind") != "model_generated_patches" or seed.get("status") != "complete":
+        raise ValueError("reuse source must be a completed model generation artifact")
+    match = ("input_sha256", "provider", "model", "base_url", "temperature",
+             "max_output_tokens", "num_candidates", "prompt_protocol")
+    for key in match:
+        if seed.get("config", {}).get(key) != report["config"].get(key):
+            raise ValueError(f"reuse source has incompatible configuration: {key}")
+    allowed = {t["id"] for t in tasks}
+    existing = {r["id"]: r for r in report["records"]}
+    for r in seed["records"]:
+        if r["id"] not in allowed:
+            continue
+        if len(r["candidates"]) > report["config"]["num_candidates"]:
+            raise ValueError(f"reuse source has too many candidates for {r['id']}")
+        if r["id"] in existing:
+            current = existing[r["id"]]["candidates"]
+            if current and current != r["candidates"][:len(current)]:
+                raise ValueError(f"candidate conflict for reused task: {r['id']}")
+            existing[r["id"]]["candidates"] = [dict(c) for c in r["candidates"]]
+        else:
+            new = {"id": r["id"], "candidates": [dict(c) for c in r["candidates"]]}
+            report["records"].append(new)
+            existing[r["id"]] = new
+    print(f"Reused completed model candidates for {len(seed['records'])} seed task(s)", flush=True)
+
+
 def manifest_config(args: argparse.Namespace, input_bytes: bytes) -> dict[str, Any]:
     return {
         "input_sha256": sha256(input_bytes),
@@ -175,6 +250,8 @@ def manifest_config(args: argparse.Namespace, input_bytes: bytes) -> dict[str, A
 def generate(args: argparse.Namespace) -> dict[str, Any]:
     if args.max_tasks < 1 or not 1 <= args.num_candidates <= 5:
         raise ValueError("--max-tasks must be >=1; --num-candidates must be 1 to 5")
+    if getattr(args, "retries", 4) not in range(0, 9) or getattr(args, "retry_wait", 4.0) < 0:
+        raise ValueError("--retries must be 0 to 8 and --retry-wait must be >= 0")
     input_bytes = args.input.read_bytes()
     tasks = json.loads(input_bytes)[:args.max_tasks]
     if not tasks:
@@ -194,6 +271,13 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
         }
         atomic_json(args.output, report)
 
+    if getattr(args, "reuse_generations", None):
+        source = args.reuse_generations.resolve()
+        if source == args.output.resolve():
+            raise ValueError("--reuse-generations cannot be the same file as --output")
+        seed_from_existing(report, source, tasks)
+        atomic_json(args.output, report)
+
     client = ModelClient(args.provider, args.model, args.base_url, args.temperature, args.max_tokens)
     records_by_id = {r["id"]: r for r in report["records"]}
     for index, task in enumerate(tasks, 1):
@@ -207,7 +291,11 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
             # Query only public fields: issue, buggy_code and public tests.
             # Save every completed model call so interrupted runs can resume.
             try:
-                response_text, tokens = client.generate(prompt)
+                response_text, tokens, retries = generate_with_retries(
+                    client, prompt, task["id"], variant,
+                    max_retries=getattr(args, "retries", 4),
+                    initial_delay=getattr(args, "retry_wait", 4.0),
+                )
             except Exception as exc:
                 atomic_json(args.output, report)
                 raise RuntimeError(
@@ -222,6 +310,7 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
                     "code": source,
                     "valid_python": True,
                     "tokens": tokens,
+                    "retry_count": retries,
                     "prompt_sha256": sha256(prompt.encode()),
                 }
             except ValueError as exc:
@@ -233,6 +322,7 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
                     "valid_python": False,
                     "error": str(exc)[:500],
                     "tokens": tokens,
+                    "retry_count": retries,
                     "prompt_sha256": sha256(prompt.encode()),
                 }
             item["candidates"].append(candidate)
@@ -387,6 +477,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", type=Path, default=DEFAULT_CASES)
     p.add_argument("--output", type=Path, default=DEFAULT_GENERATIONS)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--reuse-generations", type=Path, default=None,
+                   help="Reuse completed candidates from a previous compatible pilot")
+    p.add_argument("--retries", type=int, default=4,
+                   help="Maximum additional attempts for transient API errors (default: 4)")
+    p.add_argument("--retry-wait", type=float, default=4.0,
+                   help="Initial retry delay in seconds (default: 4)")
     p = commands.add_parser("score", help="Score real patches in network-disabled Docker only.")
     p.add_argument("--generations", type=Path, default=DEFAULT_GENERATIONS)
     p.add_argument("--input", type=Path, default=DEFAULT_CASES)

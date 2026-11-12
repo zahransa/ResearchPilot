@@ -66,6 +66,50 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual('complete', second['status'])
             self.assertEqual('model_generated_patches', second['artifact_kind'])
 
+    def test_transient_error_retried_without_retrying_bad_requests(self):
+        class TransientError(Exception):
+            code = 500
+        class BadRequest(Exception):
+            code = 400
+        class SometimesFails:
+            count = 0
+            def generate(self, prompt):
+                self.count += 1
+                if self.count <= 2:
+                    raise TransientError('temporary API 500')
+                return 'def solve(x): return x', {'total': 9}
+        client = SometimesFails()
+        with patch.object(experiment.time, 'sleep'), \
+             patch.object(experiment.random, 'uniform', return_value=0.0):
+            src, usage, retry_count = experiment.generate_with_retries(
+                client, 'test', 'task', 0, max_retries=3, initial_delay=0
+            )
+        self.assertEqual(3, client.count)
+        self.assertEqual(2, retry_count)
+        self.assertTrue(src.startswith('def solve'))
+        self.assertFalse(experiment.is_transient_api_error(BadRequest()))
+
+    def test_seed_previous_three_task_pilot_into_sixteen_task_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            pilot = gen_args(folder/'pilot.json', num=2)
+            pilot.max_tasks = 3
+            full = gen_args(folder/'full.json', num=2)
+            full.max_tasks = 16
+            full.reuse_generations = pilot.output
+            with patch.object(experiment, 'ModelClient', StubModel):
+                experiment.generate(pilot)
+                self.assertEqual(6, StubModel.calls)
+                experiment.generate(full)
+            result = json.loads(full.output.read_text())
+            self.assertEqual(16, len(result['records']))
+            self.assertEqual(32, StubModel.calls)
+            self.assertEqual(2, len(result['records'][0]['candidates']))
+            self.assertEqual('complete', result['status'])
+            pilot_r = json.loads(pilot.output.read_text())
+            self.assertEqual(pilot_r['records'][0]['candidates'],
+                             result['records'][0]['candidates'])
+
     def test_scoring_paired_same_candidate_pool_offline_trusted_stubs(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
